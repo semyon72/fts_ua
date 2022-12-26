@@ -16,13 +16,14 @@ class TriggerIntegrityError(Exception):
 
     kinds = ('content_table', 'trigger', 'sql_function', 'fts_table')
 
-    def __init__(self, kind: str, table_name,  *args: object) -> None:
+    def __init__(self, kind: str, name,  *args: object) -> None:
         if kind not in self.kinds:
             raise ValueError(f'unknown kind "{kind}"')
 
         self.kind = kind
+        self.name = name
 
-        msg = f'{" ".join(kind.split("_"))} "{table_name}" does not exist'
+        msg = f'{" ".join(kind.split("_"))} "{name}" does not exist'
         if args:
             msg = f'{msg} {args[0]}'
 
@@ -50,14 +51,6 @@ class TriggerBase:
     def get_sql_func_name(self) -> str:
         return self.get_trigger_name() + '_replicate'
 
-    def get_fts_rowid(self, content_row: dict) -> int:
-        """
-            Concrete implementation that will return effective rowid for fts index.
-            If fts index contains the columns from different content tables probably will be need
-            run sub select to get effective rowid
-        """
-        return content_row[self.pk_name]
-
     def get_trigger_columns(self) -> list:
         cols = [c for c in self.column_map if c != self.pk_name]
         cols.insert(0, self.pk_name)
@@ -75,7 +68,8 @@ class TriggerBase:
         trg_cols = [f"{ref_name}.{c}" for c in self.get_trigger_columns()]
         sql = f'CREATE TRIGGER {self.get_trigger_name()} AFTER {self.trigger_on.upper()} ON {self.table_name} BEGIN'\
               f' SELECT {self.get_sql_func_name()}({", ".join(trg_cols)}); END;'
-        self.con.execute(sql).close()
+        with self.con:
+            self.con.execute(sql).close()
 
     def create(self):
         """
@@ -87,7 +81,8 @@ class TriggerBase:
 
     def register_sql_func(self):
         num_prms = len(self.get_trigger_columns())
-        self.con.create_function(self.get_sql_func_name(), num_prms, self._trigger_func)
+        with self.con:
+            self.con.create_function(self.get_sql_func_name(), num_prms, self._trigger_func)
 
     @staticmethod
     def _is_integrated(con: sqlite.Connection, **where):
@@ -112,12 +107,12 @@ class TriggerBase:
         """
         if all:
             if not self._is_integrated(self.con, name=self.table_name, type='table'):
-                TriggerIntegrityError('content_table', self.table_name)
+                raise TriggerIntegrityError('content_table', self.table_name)
             if not self._is_integrated(self.fts_con, name=self.get_fts_table_name(), type='table'):
-                TriggerIntegrityError('fts_table', self.get_fts_table_name())
+                raise TriggerIntegrityError('fts_table', self.get_fts_table_name())
 
         if not self._is_integrated(self.con, name=self.get_trigger_name(), type='trigger', tbl_name=self.table_name):
-            TriggerIntegrityError('trigger', self.get_trigger_name(), f'for table {self.table_name}')
+            raise TriggerIntegrityError('trigger', self.get_trigger_name(), f'for table {self.table_name}')
 
         if not self._is_sql_function_exist():
             raise TriggerIntegrityError('sql_function', self.get_sql_func_name())
@@ -158,6 +153,25 @@ class TriggerBase:
         handler = getattr(fts_driver, self.trigger_on.lower())
         return handler
 
+    def get_fts_rowid(self, content_row: dict) -> int:
+        """
+            Concrete implementation that will return effective rowid for fts index.
+            If fts index contains the columns from different content tables probably will be need
+            run sub select to get effective rowid
+        """
+        return content_row[self.pk_name]
+
+    def get_fts_data(self, fts_rowid: int, fts_data: dict, trigger_data: dict) -> dict:
+        """
+            Hook to modify data before inserting (pass) into the fts index (corresponding fts_driver handler).
+        :param fts_rowid: rowid that returned by get_fts_rowid(...), default trigger_data[self.pk_name]
+        :param fts_data: have no rowid and contain only columns defined in the fts index (via mapping)
+        :param trigger_data: the data received by the trigger (old.column, ..., new.column).
+        Each column is a column of "content" table.
+        :return:
+        """
+        return fts_data
+
     def trigger_func(self, **kwargs):
         """
             Concrete implementation for INSERT, DELETE and UPDATE triggers
@@ -167,7 +181,7 @@ class TriggerBase:
         # data must have keys that mapped into fts columns
         kwargs.pop(self.pk_name, None)
         data = {self.column_map[c]: v for c, v in kwargs.items()}
-        self.get_driver_handler()(fts_rowid, data)
+        self.get_driver_handler()(fts_rowid, self.get_fts_data(fts_rowid, data, kwargs))
 
 
 class Trigger(TriggerBase):

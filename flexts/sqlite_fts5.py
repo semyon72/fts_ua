@@ -11,6 +11,18 @@ import sqlite3 as sqlite
 
 
 class SQLiteFTS5SQLBuilder:
+    """
+        https://www.sqlite.org/fts5.html
+        CREATE VIRTUAL TABLE fts_table_name USING fts5(col1, col2, tokenize = 'porter ascii'); valued fts with tokenizer
+        CREATE VIRTUAL TABLE fts_table_name USING fts5(col1, col2 UNINDEXED); - col2 - unindexed column
+        CREATE VIRTUAL TABLE fts_table_name USING fts5(col1, col2, content=''); contentless table
+        CREATE VIRTUAL TABLE fts_table_name USING fts5(col1, col2, content=ext_content_tbl, content_rowid=ext_content_tbl_pk);
+
+        DELETION (for external content and contentless)
+        INSERT INTO fts_tbl_name(fts_tbl_name, rowid, col1, col2) VALUES('delete', 14, col1_val, col2_val);
+        INSERT INTO fts_tbl_name(fts_tbl_name) VALUES('delete-all');
+    """
+
 
     _cols_template_key = 'columns'
     _prms_template_key = 'params'
@@ -61,6 +73,11 @@ class SQLiteFTS5TooManyBrokenIndexesError(Exception):
     pass
 
 
+# 2022-12-06
+# SQLiteFTS5 was added the facilities for unindexed columns
+# but for contentless index it has no sense (contentless - default for now).
+# Also new facilities compatible with old behaviour and tests but was not tested.
+
 class SQLiteFTS5:
     pk_name = 'rowid'
 
@@ -68,6 +85,7 @@ class SQLiteFTS5:
                  connection: sqlite.Connection,
                  index_name: str,
                  index_columns: Union[Iterable, str] = 'content',
+                 unindexed_columns: Union[Iterable, str, None] = None,
                  rowfactory=None) -> None:
 
         self._connection = connection
@@ -78,6 +96,7 @@ class SQLiteFTS5:
             self._connection.row_factory = sqlite.Row
 
         self.index_columns = index_columns
+        self.unindexed_columns = unindexed_columns
 
         self.index_name = str(index_name)
         self.sql_builder = SQLiteFTS5SQLBuilder(self.index_name)
@@ -88,12 +107,30 @@ class SQLiteFTS5:
 
     @index_columns.setter
     def index_columns(self, index_columns):
-        icols = list(index_columns) if isinstance(index_columns, Iterable) else [str(index_columns)]
+        if not isinstance(index_columns, Iterable):
+            raise ValueError('Value must be str or Iterable')
+        icols = [str(index_columns)] if isinstance(index_columns, str) else list(index_columns)
         try:
             icols.remove(self.pk_name)
         except ValueError:
             pass
         self._index_columns = icols
+
+    @property
+    def unindexed_columns(self):
+        return self._unindexed_columns
+
+    @unindexed_columns.setter
+    def unindexed_columns(self, unindexed_columns):
+        res = []
+        if unindexed_columns:
+            if not isinstance(unindexed_columns, Iterable):
+                raise ValueError('Value must be str or Iterable if it evaluates as True')
+            res = [str(unindexed_columns)] if isinstance(unindexed_columns, str) else list(unindexed_columns)
+            ex_cols = set(res) - set(self.index_columns)
+            if ex_cols:
+                raise ValueError(f'unindexed_columns must be subset of index_columns. {ex_cols} is extra set')
+        self._unindexed_columns = res
 
     def check_index(self) -> bool:
         cursor = self._connection.execute(
@@ -108,13 +145,21 @@ class SQLiteFTS5:
     def create_index(self, extra: dict = None):
         # execute SQL to create contentless fts5 index
         # CREATE VIRTUAL TABLE blog_fts USING fts5(title, text, content='');
+        # SQLiteFTS5 was added the facilities for unindexed columns
+        # but for contentless index it has no sense (default for now).
+        # Also new facilities compatible with old behaviour and tests but was not tested.
 
         _extra = {'content': ''}
         if extra is not None:
             extra.pop('content', None)
             _extra.update(extra)
 
-        cols = [*self.index_columns, *[f'{p}=\'{v}\'' for p, v in _extra.items()]]
+        uic = self.unindexed_columns
+        cols = [
+            *(f'{c}{" UNINDEXED" if c in uic else ""}' for c in self.index_columns),
+            *(f'{p}=\'{v}\'' for p, v in _extra.items())
+        ]
+        res = True
         with self._connection as idx_con:
             if not self.check_index():
                 cursor = idx_con.execute(f"CREATE VIRTUAL TABLE {self.index_name} USING fts5 ({', '.join(cols)})")
@@ -123,9 +168,8 @@ class SQLiteFTS5:
                     f"CREATE VIRTUAL TABLE IF NOT EXISTS {self.index_name}_v USING fts5vocab ({self.index_name}, instance)"
                 )
                 cursor.close()
-                return cursor.rowcount == -1
-            else:
-                return True
+                res = cursor.rowcount == -1
+        return res
 
     def drop_index(self):
         with self._connection as idx_con:
@@ -253,11 +297,15 @@ class SQLiteFTS5:
             if data contains rowid key then rowid parameter value will be redefined by data's rowid value
         """
         self._check_columns(data)
-        with self._connection as idx_con:
+        with self._connection as con:
             _data = self.prepare_data(rowid, data)
-            cursor = idx_con.execute(self.sql_builder.build(_data), _data)
-            assert cursor.rowcount == 1, f'cursor.rowcount is {cursor.rowcount} expected 1'
-            cursor.close()
+
+            cursor = con.cursor()
+            try:
+                cursor.execute(self.sql_builder.build(_data), _data)
+                assert cursor.rowcount == 1, f'cursor.rowcount is {cursor.rowcount} expected 1'
+            finally:
+                cursor.close()
 
     def update(self, rowid, data: dict):
         """
